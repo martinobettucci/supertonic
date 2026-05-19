@@ -1,10 +1,10 @@
 [project]
-name = "tts-onnx"
-version = "1.0.0"
-description = "TTS ONNX Inference"
+name = "supertonic"
+version = "3.0.0"
+description = "Supertonic ONNX text-to-speech inference"
 requires-python = ">=3.10"
 dependencies = [
-    "onnxruntime==1.23.1",
+    "onnxruntime>=1.23.1",
     "numpy>=1.26.0",
     "soundfile>=0.12.1",
     "librosa>=0.10.0",
@@ -12,9 +12,9 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = []
+packages = ["supertonic"]
+py-modules = ["helper"]
 
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
-
