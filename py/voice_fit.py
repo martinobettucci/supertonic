@@ -170,15 +170,73 @@ def blend(weights: np.ndarray, ttl_presets, dp_presets):
 
 
 # --------------------------------------------------------------------------- #
+# PCA subspace: escape the convex hull to reach ORIGINAL voices.              #
+# A softmax blend is trapped inside the simplex of the K presets (every voice #
+# is a *mixture*). PCA over the presets spans the same affine subspace but    #
+# with UNBOUNDED coordinates, so coefficients outside the observed range      #
+# extrapolate past every preset -> genuinely new timbres, not mixtures. We    #
+# PCA the concatenated [style_ttl ; style_dp] jointly (they co-vary per       #
+# speaker) and standardize each axis, so a coefficient reads as "how many     #
+# standard deviations along this principal direction."                        #
+# --------------------------------------------------------------------------- #
+def build_pca(ttl_presets, dp_presets, n_comp):
+    K = ttl_presets.shape[0]
+    ttl_flat = ttl_presets.reshape(K, -1).astype(np.float64)
+    dp_flat = dp_presets.reshape(K, -1).astype(np.float64)
+    X = np.concatenate([ttl_flat, dp_flat], axis=1)            # [K, D]
+    mean = X.mean(axis=0)
+    _, S, Vt = np.linalg.svd(X - mean, full_matrices=False)
+    rank = int(np.sum(S > 1e-8))
+    n_comp = max(1, min(n_comp, rank))
+    return {
+        "mean": mean,
+        "comps": Vt[:n_comp],                                  # [n_comp, D], orthonormal
+        "scales": S[:n_comp] / np.sqrt(max(K - 1, 1)),         # per-axis std dev
+        "split": ttl_flat.shape[1],
+        "ttl_shape": tuple(ttl_presets.shape[1:]),
+        "dp_shape": tuple(dp_presets.shape[1:]),
+        "n_comp": n_comp,
+    }
+
+
+def pca_to_style(coef, pca):
+    """Standardized PCA coefficients -> (style_ttl, style_dp)."""
+    coef = np.asarray(coef, np.float64)
+    x = pca["mean"] + (coef * pca["scales"]) @ pca["comps"]    # [D]
+    s = pca["split"]
+    ttl = x[:s].reshape(pca["ttl_shape"]).astype(np.float32)
+    dp = x[s:].reshape(pca["dp_shape"]).astype(np.float32)
+    return ttl, dp
+
+
+def pca_describe(coef, pca, ttl_presets, dp_presets, names):
+    """Report how 'original' a voice is: distance from the preset mean (in std
+    units) and the single nearest preset by cosine (1.0 == identical timbre)."""
+    ttl, dp = pca_to_style(coef, pca)
+    v = np.concatenate([ttl.ravel(), dp.ravel()]).astype(np.float64)
+    P = np.concatenate([ttl_presets.reshape(len(names), -1),
+                        dp_presets.reshape(len(names), -1)], axis=1).astype(np.float64)
+    cos = (P @ v) / (np.linalg.norm(P, axis=1) * np.linalg.norm(v) + 1e-9)
+    j = int(np.argmax(cos))
+    return float(np.linalg.norm(coef)), names[j], float(cos[j])
+
+
+# --------------------------------------------------------------------------- #
 # Objective: render candidate style -> embed -> 1 - cosine similarity.        #
 # --------------------------------------------------------------------------- #
 class Objective:
-    def __init__(self, tts, encoder, target_emb, presets, calib, lang,
-                 total_step, speed, seed):
+    """Maps a search vector -> style via `decode`, renders calibration audio,
+    and scores 1 - cosine(speaker_embedding, target). `decode` is the only thing
+    that differs between modes: a convex blend (BLEND) or a PCA reconstruction
+    (PCA). `penalty` is an optional regularizer on the search vector."""
+
+    def __init__(self, tts, encoder, target_emb, decode, calib, lang,
+                 total_step, speed, seed, penalty=None):
         self.tts = tts
         self.encoder = encoder
         self.target = target_emb
-        self.ttl_presets, self.dp_presets = presets
+        self.decode = decode                       # x -> (ttl[d1,d2], dp[e1,e2])
+        self.penalty = penalty or (lambda x: 0.0)
         self.calib = calib
         self.lang = lang
         self.total_step = total_step
@@ -188,7 +246,7 @@ class Objective:
         self.best = (np.inf, None)
 
     def render(self, ttl, dp, text):
-        # Fix RNG so the same weights -> the same audio (the flow sampler draws
+        # Fix RNG so the same vector -> the same audio (the flow sampler draws
         # Gaussian noise per call). Without this the objective is noisy and CMA
         # converges far slower.
         np.random.seed(self.seed)
@@ -197,17 +255,18 @@ class Objective:
         T = int(self.tts.sample_rate * float(np.asarray(dur).reshape(-1)[0]))
         return wav[0, :T]
 
-    def __call__(self, weights: np.ndarray) -> float:
-        ttl, dp, _ = blend(np.asarray(weights, np.float32), self.ttl_presets, self.dp_presets)
+    def __call__(self, x: np.ndarray) -> float:
+        x = np.asarray(x, np.float32)
+        ttl, dp = self.decode(x)
         sims = []
         for text in self.calib:
             wav = self.render(ttl, dp, text)
             emb = self.encoder.embed_wav(wav, self.tts.sample_rate)
             sims.append(float(np.dot(emb, self.target)))  # both normalized -> cosine
-        loss = 1.0 - float(np.mean(sims))
+        loss = 1.0 - float(np.mean(sims)) + float(self.penalty(x))
         self.n_eval += 1
         if loss < self.best[0]:
-            self.best = (loss, np.array(weights, np.float32))
+            self.best = (loss, x.copy())
         if self.n_eval % 10 == 0:
             print(f"  eval {self.n_eval:4d} | loss {loss:.4f} | best {self.best[0]:.4f}")
         return loss
@@ -216,13 +275,13 @@ class Objective:
 # --------------------------------------------------------------------------- #
 # Optimizers: CMA-ES (preferred) with a SciPy Powell fallback.                #
 # --------------------------------------------------------------------------- #
-def optimize(objective, dim, budget, sigma0=0.6):
-    x0 = np.zeros(dim, np.float32)  # softmax(0) = uniform blend: neutral start
+def optimize(objective, dim, budget, sigma0=0.6, bound=4.0):
+    x0 = np.zeros(dim, np.float32)  # neutral start (blend: uniform; pca: preset mean)
     try:
         import cma
         es = cma.CMAEvolutionStrategy(
             x0, sigma0,
-            {"bounds": [-4.0, 4.0], "maxfevals": budget, "seed": 1, "verbose": -9},
+            {"bounds": [-bound, bound], "maxfevals": budget, "seed": 1, "verbose": -9},
         )
         while not es.stop():
             xs = es.ask()
@@ -246,7 +305,21 @@ def write_style_json(path, ttl, dp, ttl_dims, dp_dims):
     }
     with open(path, "w") as f:
         json.dump(obj, f)
-    print(f"Wrote optimized style -> {path}")
+    print(f"Wrote style -> {path}")
+
+
+def _indexed(path, i):
+    root, ext = os.path.splitext(path)
+    return f"{root}_{i}{ext}"
+
+
+def _render_demo(tts, ttl, dp, args, path):
+    print(f"Rendering demo ({args.final_steps} steps) -> {path}")
+    np.random.seed(args.seed)
+    wav, dur = tts(args.demo_text, args.lang, Style(ttl[None], dp[None]),
+                   args.final_steps, args.speed)
+    T = int(tts.sample_rate * float(np.asarray(dur).reshape(-1)[0]))
+    sf.write(path, wav[0, :T], tts.sample_rate)
 
 
 # --------------------------------------------------------------------------- #
@@ -254,10 +327,24 @@ def parse_args():
     p = argparse.ArgumentParser(description="Per-speaker Supertonic style fitting.")
     p.add_argument("--onnx-dir", default="../assets/onnx")
     p.add_argument("--voice-dir", default="../assets/voice_styles")
-    p.add_argument("--refs-dir", required=True, help="Dir of target-speaker WAV clips")
+    p.add_argument("--refs-dir", default=None,
+                   help="Dir of target-speaker WAV clips (required unless --generate)")
     p.add_argument("--out-style", default="./fitted_voice.json")
     p.add_argument("--out-demo", default="./fitted_demo.wav")
     p.add_argument("--lang", default="en")
+    p.add_argument("--mode", choices=["blend", "pca"], default="blend",
+                   help="blend = convex mix of presets (safe); "
+                        "pca = escape the convex hull for ORIGINAL voices")
+    p.add_argument("--pca-comps", type=int, default=8,
+                   help="PCA components for --mode pca / --generate (<= #presets-1)")
+    p.add_argument("--pca-l2", type=float, default=0.02,
+                   help="L2 penalty on PCA coefficients (keeps voices plausible)")
+    p.add_argument("--generate", type=int, default=0, metavar="N",
+                   help="Generate N original voices by sampling PCA space "
+                        "(no reference needed); skips fitting")
+    p.add_argument("--gen-sigma", type=float, default=1.4,
+                   help="Std-dev of sampled PCA coefficients when generating")
+    p.add_argument("--gen-seed", type=int, default=0, help="RNG seed for --generate")
     p.add_argument("--budget", type=int, default=200, help="Max objective evaluations")
     p.add_argument("--opt-steps", type=int, default=4,
                    help="Denoising steps DURING search (low = fast/noisy)")
@@ -280,10 +367,30 @@ def main():
 
     print("Loading frozen Supertonic ONNX pipeline...")
     tts = load_text_to_speech(args.onnx_dir, use_gpu=False)
+    names, ttl_presets, dp_presets, ttl_dims, dp_dims = load_presets(args.voice_dir)
 
+    # ---- Generation: create ORIGINAL voices by sampling PCA space (no refs) ----
+    if args.generate > 0:
+        pca = build_pca(ttl_presets, dp_presets, args.pca_comps)
+        print(f"\nGenerating {args.generate} original voice(s) from {pca['n_comp']}-D "
+              f"PCA space (sigma={args.gen_sigma}) ...")
+        rng = np.random.default_rng(args.gen_seed)
+        for i in range(args.generate):
+            coef = rng.standard_normal(pca["n_comp"]) * args.gen_sigma
+            ttl, dp = pca_to_style(coef, pca)
+            norm, near, cos = pca_describe(coef, pca, ttl_presets, dp_presets, names)
+            print(f"  voice {i}: |coef|={norm:4.2f} std | nearest preset {near} "
+                  f"(cos {cos:.3f})")
+            write_style_json(_indexed(args.out_style, i), ttl, dp, ttl_dims, dp_dims)
+            _render_demo(tts, ttl, dp, args, _indexed(args.out_demo, i))
+        print("Done generating original voices.")
+        return
+
+    # ---- Fitting (blend or pca) needs a reference ----
     print("Loading speaker encoder (metric)...")
     encoder = _load_speaker_encoder()
-
+    if not args.refs_dir:
+        raise SystemExit("--refs-dir is required for fitting (omit it only with --generate).")
     print(f"Building target embedding from clips in {args.refs_dir} ...")
     ref_files = [os.path.join(args.refs_dir, f) for f in sorted(os.listdir(args.refs_dir))
                  if f.lower().endswith((".wav", ".flac", ".mp3", ".m4a", ".ogg"))]
@@ -293,32 +400,39 @@ def main():
     target = target / (np.linalg.norm(target) + 1e-9)
     print(f"  averaged {len(ref_files)} reference clips into target embedding")
 
-    names, ttl_presets, dp_presets, ttl_dims, dp_dims = load_presets(args.voice_dir)
+    if args.mode == "pca":
+        pca = build_pca(ttl_presets, dp_presets, args.pca_comps)
+        decode = lambda x: pca_to_style(x, pca)                          # noqa: E731
+        penalty = lambda x: args.pca_l2 * float(np.mean(np.square(x)))   # noqa: E731
+        dim, sigma0, bound = pca["n_comp"], 1.0, 3.5
+        print(f"\nFitting in PCA mode: {dim}-D coefficients (can leave the convex "
+              f"hull), L2={args.pca_l2}, budget={args.budget} ...")
+    else:
+        decode = lambda x: blend(x, ttl_presets, dp_presets)[:2]         # noqa: E731
+        penalty = None
+        dim, sigma0, bound = len(names), 0.6, 4.0
+        print(f"\nFitting in BLEND mode: {dim} convex weights, budget={args.budget} ...")
 
-    objective = Objective(
-        tts, encoder, target, (ttl_presets, dp_presets),
-        args.calib, args.lang, args.opt_steps, args.speed, args.seed,
-    )
+    objective = Objective(tts, encoder, target, decode, args.calib, args.lang,
+                          args.opt_steps, args.speed, args.seed, penalty)
+    x = optimize(objective, dim=dim, budget=args.budget, sigma0=sigma0, bound=bound)
+    ttl, dp = decode(x)
 
-    print(f"\nOptimizing {len(names)} blend weights (budget={args.budget}) ...")
-    w = optimize(objective, dim=len(names), budget=args.budget)
-
-    ttl, dp, mix = blend(w, ttl_presets, dp_presets)
-    ranking = sorted(zip(names, mix), key=lambda t: -t[1])
-    print("\nFinal preset mix:")
-    for n, a in ranking:
-        if a > 0.01:
-            print(f"  {n:>4s}: {a:5.1%}")
+    if args.mode == "pca":
+        norm, near, cos = pca_describe(x, pca, ttl_presets, dp_presets, names)
+        print(f"\nOriginal voice: {norm:.2f} std from the preset mean | nearest single "
+              f"preset {near} (cos {cos:.3f}; <1 means it is NOT any mixture).")
+        print("  coefficients:", [round(float(c), 2) for c in x])
+    else:
+        _, _, mix = blend(x, ttl_presets, dp_presets)
+        print("\nFinal preset mix:")
+        for n, a in sorted(zip(names, mix), key=lambda t: -t[1]):
+            if a > 0.01:
+                print(f"  {n:>4s}: {a:5.1%}")
 
     write_style_json(args.out_style, ttl, dp, ttl_dims, dp_dims)
-
-    print(f"Rendering final demo ({args.final_steps} steps) ...")
-    np.random.seed(args.seed)
-    wav, dur = tts(args.demo_text, args.lang, Style(ttl[None], dp[None]),
-                   args.final_steps, args.speed)
-    T = int(tts.sample_rate * float(np.asarray(dur).reshape(-1)[0]))
-    sf.write(args.out_demo, wav[0, :T], tts.sample_rate)
-    print(f"Wrote demo -> {args.out_demo}\nDone. Best loss = {objective.best[0]:.4f}")
+    _render_demo(tts, ttl, dp, args, args.out_demo)
+    print(f"Done. Best loss = {objective.best[0]:.4f}")
 
 
 if __name__ == "__main__":
@@ -334,10 +448,11 @@ if __name__ == "__main__":
 #      it usually moves the optimum more than any other single change.
 #   2. NOISE: instead of one fixed seed, average the loss over a SMALL fixed seed set
 #      (e.g. 3 seeds) for a smoother, more robust landscape — at 3x the eval cost.
-#   3. SUBSPACE: add a PCA mode. With K=10 presets, PCA(mean + <=9 comps) spans the
-#      same affine subspace as the blend, but lets you exceed the convex hull
-#      (extrapolate past any single preset). Parameterize by component coefficients
-#      and add an L2 penalty on coefficient magnitude to avoid drifting off-manifold.
+#   3. SUBSPACE: [DONE] PCA mode (--mode pca) and original-voice generation
+#      (--generate N). PCA(mean + <=K-1 comps) spans the preset affine subspace but
+#      with unbounded, standardized coefficients, so it can exceed the convex hull
+#      (extrapolate past any single preset). An L2 penalty (--pca-l2) keeps samples
+#      plausible. Next: decouple ttl/dp PCA, or learn the subspace from a real corpus.
 #   4. DECOUPLE: give style_ttl (timbre) and style_dp (pacing) SEPARATE weight vectors
 #      (search dim 2K). Often pacing wants a different mix than timbre.
 #   5. CONTENT MATCH: make the calibration text match phonetic content in your refs,
