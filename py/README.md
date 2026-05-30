@@ -143,3 +143,14 @@ This will:
 - **Quality vs Speed**: Higher `--total-step` values produce better quality but take longer
 - **GPU Support**: GPU mode is not supported yet
 
+## Voice Fitting (Experimental)
+
+`voice_fit.py` fits a custom voice to **your own recordings** by searching the voice-style space
+(a blend of the shipped presets) so the frozen synthesizer best matches a target speaker — a local
+*analysis-by-synthesis* approximation of voice cloning, no retraining. It outputs a style JSON that
+drops straight into `example_onnx.py --voice-style`. This is **not** the official
+[Voice Builder](https://supertonic.supertone.ai/voice-builder); it reaches the closest *reachable*
+timbre, not an exact clone.
+
+See **[VOICE_FIT.md](VOICE_FIT.md)** for prerequisites, installation, usage, and limitations.
+
