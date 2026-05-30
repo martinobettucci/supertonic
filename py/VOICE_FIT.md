@@ -11,6 +11,11 @@ shipped ONNX assets — no model retraining.
 > approximation that blends the shipped presets to reach the *closest reachable* timbre. For
 > production-grade cloning, use Voice Builder.
 
+**Status:** verified end-to-end against the public Supertonic-3 assets. Fitting against audio
+rendered from a known preset recovers that preset as the top blend component, and the output JSON
+loads in stock Supertonic unchanged. Result sharpness scales with `--budget` / `--opt-steps` and
+the speaker metric (the defaults are fast-iteration starting points).
+
 ## How It Works
 
 Supertonic ships no audio→style encoder. A "voice" is just two stored tensors (`style_ttl`,

@@ -57,9 +57,11 @@ RUN
 Then use the result with stock Supertonic:
     python example_onnx.py --voice-style ./me.json --text "Hello, this is my voice."
 
-NOTE: This is a validated scaffold (checked against the repo's I/O contracts and the
-style-JSON format), not an end-to-end-tested pipeline — the ONNX weights live behind
-a network boundary and weren't run here. Expect to tune knobs.
+NOTE: Verified end-to-end against the public Supertonic-3 ONNX assets. The full loop
+(preset blend -> ONNX synthesis -> speaker embedding -> CMA-ES -> style JSON + demo WAV)
+runs, and fitting against clips rendered from a known preset recovers that preset as the
+dominant blend component. Quality scales with --budget, --opt-steps, and the speaker
+metric; the defaults are fast-iteration starting points, not converged settings.
 """
 
 import argparse
