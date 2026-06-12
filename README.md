@@ -36,6 +36,9 @@ Arabic (`ar`), Bulgarian (`bg`), Croatian (`hr`), Czech (`cs`), Danish (`da`), D
 
 ### 📰 Update News
 
+=======
+- **2026.06.12** - Added Python segment-prefetch streaming, incremental text input, typed PCM chunks, and overlap-windowed vocoder decoding. See [Streaming ONNX Runtime](STREAMING.md).
+- **2026.06.12** - Added a persistent localhost HTTP/WebSocket API with generation metrics and Whisper WER evaluation. See [Local API Server](API_SERVER.md).
 - **2026.05.18** - Python SDK v1.3.1 adds **`supertonic serve`**, a local HTTP server with native `/v1/tts` and OpenAI-compatible `/v1/audio/speech` endpoints. See the [serve documentation](https://supertone-inc.github.io/supertonic-py/cli/serve/).
 - **2026.05.18** - **[Voice Builder](https://supertonic.supertone.ai/voice-builder)** now supports **Supertonic 3**. Create a permanent custom voice profile for Supertonic and download version-specific JSON files for both Supertonic 2 and Supertonic 3. If you already created a Supertonic 2 voice, the matching Supertonic 3 JSON is now available from [My Page](https://supertonic.supertone.ai/my-page).
 - **2026.04.29** - 🎉 **Supertonic 3** released with **31-language support**, improved reading accuracy, fewer repeat/skip failures, and v2-compatible public ONNX assets. [Demo](https://huggingface.co/spaces/Supertone/supertonic-3) | [Models](https://huggingface.co/Supertone/supertonic-3)

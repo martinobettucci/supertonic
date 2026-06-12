@@ -120,6 +120,70 @@ This will:
 - Default speed is 1.05 if not specified
 - Recommended speed range is between 0.9 and 1.5 for natural-sounding results
 
+### Example 6: Incremental PCM Streaming
+
+Run the streaming example with the CPU real-time profile:
+
+```bash
+uv run example_streaming.py \
+  --voice-style ../assets/voice_styles/F1.json \
+  --lang en \
+  --total-step 3 \
+  --simulate-playback
+```
+
+Or consume PCM blocks directly:
+
+```python
+from helper import load_text_to_speech, load_voice_style
+
+tts = load_text_to_speech("../assets/onnx", use_gpu=False)
+style = load_voice_style(["../assets/voice_styles/F1.json"])
+
+for chunk in tts.stream(
+    "The first sentence plays while the next one is generated.",
+    "en",
+    style,
+):
+    audio_device.write(chunk.audio)
+```
+
+The stream accepts either a complete string or an iterable of incoming text
+fragments. Synthesis runs in a background thread and emits mono float32 PCM
+blocks with segment and timing metadata.
+
+The public Supertonic 3 latent graph is non-causal, so the first PCM block is
+available after one linguistic segment has completed. This API provides
+segment-prefetch streaming; it is not token-level causal generation. See
+[`STREAMING.md`](../STREAMING.md) for architecture details and the native
+causal-model roadmap.
+
+Streaming defaults to three denoising steps. Increase the value for quality or
+reduce it for latency. Real-time performance depends on hardware and segment
+length.
+
+### Example 7: Persistent Local API
+
+Start the model server on a loopback address:
+
+```bash
+uv sync --extra server
+uv run serve_api.py --host 127.0.0.1 --port 8765
+```
+
+The process loads the ONNX sessions, voice styles, and Whisper ASR once, then
+keeps them ready for batch HTTP and streaming WebSocket requests. Run the
+end-to-end client in another terminal:
+
+```bash
+uv run benchmark_api.py --mode both --output-dir results/api
+```
+
+The client saves full and streamed WAV files, per-request metrics, aggregate
+server metrics, Whisper transcripts, and WER measurements. See
+[`API_SERVER.md`](../API_SERVER.md) for the request schema and WebSocket
+protocol.
+
 ## Available Arguments
 
 | Argument | Type | Default | Description |

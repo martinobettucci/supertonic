@@ -2,11 +2,13 @@
 
 from helper import (
     AVAILABLE_LANGS,
+    AudioChunk,
     Style,
     TextToSpeech,
     UnicodeProcessor,
     chunk_text,
     get_latent_mask,
+    iter_stream_text_chunks,
     length_to_mask,
     load_cfgs,
     load_onnx,
@@ -18,15 +20,17 @@ from helper import (
     timer,
 )
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 __all__ = [
     "AVAILABLE_LANGS",
+    "AudioChunk",
     "Style",
     "TextToSpeech",
     "UnicodeProcessor",
     "chunk_text",
     "get_latent_mask",
+    "iter_stream_text_chunks",
     "length_to_mask",
     "load_cfgs",
     "load_onnx",

@@ -1,16 +1,48 @@
 import json
 import os
+import queue
+import re
+import threading
 import time
 from contextlib import contextmanager
-from typing import Optional
+from dataclasses import dataclass
+from typing import Iterable, Iterator, Optional, Union
 from unicodedata import normalize
 
 import numpy as np
 import onnxruntime as ort
 
-import re
-
 AVAILABLE_LANGS = ["en", "ko", "ja", "ar", "bg", "cs", "da", "de", "el", "es", "et", "fi", "fr", "hi", "hr", "hu", "id", "it", "lt", "lv", "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "tr", "uk", "vi", "na"]
+
+
+@dataclass(frozen=True)
+class AudioChunk:
+    """One PCM block emitted by :meth:`TextToSpeech.stream`.
+
+    Streaming is segment based: the non-causal latent model finishes one text
+    segment before its audio becomes available. A background producer then
+    synthesizes the next segment while the consumer plays the current one.
+    """
+
+    audio: np.ndarray
+    sample_rate: int
+    text: str
+    segment_index: int
+    chunk_index: int
+    segment_chunk_index: int
+    is_segment_start: bool
+    is_segment_end: bool
+    ready_after_seconds: float
+    mode: str = "segment"
+
+    @property
+    def duration_seconds(self) -> float:
+        return len(self.audio) / self.sample_rate
+
+
+@dataclass(frozen=True)
+class _StreamFailure:
+    error: Exception
 
 
 class UnicodeProcessor:
@@ -174,7 +206,7 @@ class TextToSpeech:
         noisy_latent = noisy_latent * latent_mask
         return noisy_latent, latent_mask
 
-    def _infer(
+    def _infer_latent(
         self,
         text_list: list[str],
         lang_list: list[str],
@@ -211,6 +243,19 @@ class TextToSpeech:
                     "total_step": total_step_np,
                 },
             )
+        return xt, dur_onnx
+
+    def _infer(
+        self,
+        text_list: list[str],
+        lang_list: list[str],
+        style: Style,
+        total_step: int,
+        speed: float = 1.05,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        xt, dur_onnx = self._infer_latent(
+            text_list, lang_list, style, total_step, speed
+        )
         wav, *_ = self.vocoder_ort.run(None, {"latent": xt})
         return wav, dur_onnx
 
@@ -252,6 +297,182 @@ class TextToSpeech:
         speed: float = 1.05,
     ) -> tuple[np.ndarray, np.ndarray]:
         return self._infer(text_list, lang_list, style, total_step, speed)
+
+    def stream_vocoder(
+        self,
+        latent: np.ndarray,
+        *,
+        chunk_latents: int = 32,
+        overlap_latents: int = 20,
+    ) -> Iterator[np.ndarray]:
+        """Decode a completed latent tensor with bounded vocoder windows.
+
+        The public vocoder is non-causal. Context is included on both sides of
+        each window and discarded after decoding. With the current Supertonic
+        3 graph, 20 latent positions reproduce full decoding exactly in local
+        numerical tests; smaller overlaps trade continuity for lower latency.
+        """
+        latent = np.asarray(latent, dtype=np.float32)
+        if latent.ndim != 3 or latent.shape[0] != 1:
+            raise ValueError("stream_vocoder expects latent shape [1, channels, time].")
+        if chunk_latents <= 0:
+            raise ValueError("chunk_latents must be greater than zero.")
+        if overlap_latents < 0:
+            raise ValueError("overlap_latents cannot be negative.")
+
+        latent_length = latent.shape[2]
+        samples_per_latent = self.base_chunk_size * self.chunk_compress_factor
+        for start in range(0, latent_length, chunk_latents):
+            end = min(latent_length, start + chunk_latents)
+            window_start = max(0, start - overlap_latents)
+            window_end = min(latent_length, end + overlap_latents)
+            wav, *_ = self.vocoder_ort.run(
+                None, {"latent": latent[:, :, window_start:window_end]}
+            )
+            wav_1d = np.asarray(wav[0], dtype=np.float32)
+            expected_length = (window_end - window_start) * samples_per_latent
+            if len(wav_1d) != expected_length:
+                raise RuntimeError(
+                    "Unexpected vocoder output length: "
+                    f"expected {expected_length}, got {len(wav_1d)}."
+                )
+            crop_start = (start - window_start) * samples_per_latent
+            crop_end = crop_start + (end - start) * samples_per_latent
+            yield np.ascontiguousarray(wav_1d[crop_start:crop_end])
+
+    def stream(
+        self,
+        text: Union[str, Iterable[str]],
+        lang: str,
+        style: Style,
+        *,
+        total_step: int = 4,
+        speed: float = 1.05,
+        max_segment_chars: int = 120,
+        min_segment_chars: int = 24,
+        audio_chunk_ms: float = 100.0,
+        silence_duration: float = 0.12,
+        vocoder_chunk_latents: int = 32,
+        vocoder_overlap_latents: int = 20,
+        max_buffer_seconds: float = 8.0,
+    ) -> Iterator[AudioChunk]:
+        """Stream PCM blocks with background synthesis of upcoming segments.
+
+        This is practical real-time streaming, not causal model inference. The
+        latent model is non-causal and must finish one linguistic segment
+        before audio for that segment exists. The producer runs independently
+        so later segments are prepared while earlier PCM blocks are consumed.
+        """
+        if style.ttl.shape[0] != 1:
+            raise ValueError("Streaming supports exactly one voice style.")
+        if total_step <= 0:
+            raise ValueError("total_step must be greater than zero.")
+        if speed <= 0:
+            raise ValueError("speed must be greater than zero.")
+        if audio_chunk_ms <= 0:
+            raise ValueError("audio_chunk_ms must be greater than zero.")
+        if silence_duration < 0:
+            raise ValueError("silence_duration cannot be negative.")
+        if max_buffer_seconds <= 0:
+            raise ValueError("max_buffer_seconds must be greater than zero.")
+
+        audio_chunk_samples = max(
+            1, int(round(self.sample_rate * audio_chunk_ms / 1000.0))
+        )
+        max_buffer_chunks = max(
+            1, int(round(max_buffer_seconds * 1000.0 / audio_chunk_ms))
+        )
+        output_queue: queue.Queue = queue.Queue(maxsize=max_buffer_chunks)
+        sentinel = object()
+        stop_event = threading.Event()
+        stream_started = time.perf_counter()
+
+        def enqueue(item) -> bool:
+            while not stop_event.is_set():
+                try:
+                    output_queue.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def producer() -> None:
+            global_chunk_index = 0
+            try:
+                segments = iter_stream_text_chunks(
+                    text,
+                    max_chars=max_segment_chars,
+                    min_chars=min_segment_chars,
+                )
+                for segment_index, segment in enumerate(segments):
+                    if stop_event.is_set():
+                        break
+                    latent, duration = self._infer_latent(
+                        [segment], [lang], style, total_step, speed
+                    )
+                    target_samples = min(
+                        latent.shape[2]
+                        * self.base_chunk_size
+                        * self.chunk_compress_factor,
+                        int(round(float(duration[0]) * self.sample_rate)),
+                    )
+                    pcm_parts = self.stream_vocoder(
+                        latent,
+                        chunk_latents=vocoder_chunk_latents,
+                        overlap_latents=vocoder_overlap_latents,
+                    )
+                    blocks = _iter_pcm_blocks(
+                        pcm_parts,
+                        target_samples=target_samples,
+                        chunk_samples=audio_chunk_samples,
+                        trailing_silence_samples=int(
+                            round(silence_duration * self.sample_rate)
+                        ),
+                    )
+                    block_iterator = iter(blocks)
+                    current = next(block_iterator, None)
+                    segment_chunk_index = 0
+                    while current is not None:
+                        following = next(block_iterator, None)
+                        item = AudioChunk(
+                            audio=current,
+                            sample_rate=self.sample_rate,
+                            text=segment,
+                            segment_index=segment_index,
+                            chunk_index=global_chunk_index,
+                            segment_chunk_index=segment_chunk_index,
+                            is_segment_start=segment_chunk_index == 0,
+                            is_segment_end=following is None,
+                            ready_after_seconds=time.perf_counter() - stream_started,
+                            mode="segment-prefetch",
+                        )
+                        if not enqueue(item):
+                            return
+                        global_chunk_index += 1
+                        segment_chunk_index += 1
+                        current = following
+            except Exception as exc:
+                enqueue(_StreamFailure(exc))
+            finally:
+                enqueue(sentinel)
+
+        worker = threading.Thread(
+            target=producer,
+            name="supertonic-stream-producer",
+            daemon=True,
+        )
+        worker.start()
+        try:
+            while True:
+                item = output_queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, _StreamFailure):
+                    raise item.error
+                yield item
+        finally:
+            stop_event.set()
+            worker.join(timeout=0.2)
 
 
 def length_to_mask(lengths: np.ndarray, max_len: Optional[int] = None) -> np.ndarray:
@@ -427,3 +648,120 @@ def chunk_text(text: str, max_len: int = 300) -> list[str]:
             chunks.append(current_chunk.strip())
 
     return chunks
+
+
+def iter_stream_text_chunks(
+    text: Union[str, Iterable[str]],
+    *,
+    max_chars: int = 120,
+    min_chars: int = 24,
+) -> Iterator[str]:
+    """Yield bounded linguistic segments from text or incoming text fragments."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be greater than zero.")
+    if min_chars <= 0:
+        raise ValueError("min_chars must be greater than zero.")
+    if min_chars > max_chars:
+        raise ValueError("min_chars cannot exceed max_chars.")
+
+    fragments: Iterable[str] = [text] if isinstance(text, str) else text
+    buffer = ""
+    for fragment in fragments:
+        if not isinstance(fragment, str):
+            raise TypeError("Streaming text fragments must be strings.")
+        buffer += fragment
+        while True:
+            cut = _find_stream_text_cut(
+                buffer,
+                max_chars=max_chars,
+                min_chars=min_chars,
+                final=False,
+            )
+            if cut is None:
+                break
+            segment = buffer[:cut].strip()
+            buffer = buffer[cut:].lstrip()
+            if segment:
+                yield segment
+
+    while buffer.strip():
+        cut = _find_stream_text_cut(
+            buffer,
+            max_chars=max_chars,
+            min_chars=min_chars,
+            final=True,
+        )
+        if cut is None:
+            break
+        segment = buffer[:cut].strip()
+        buffer = buffer[cut:].lstrip()
+        if segment:
+            yield segment
+
+
+def _find_stream_text_cut(
+    buffer: str,
+    *,
+    max_chars: int,
+    min_chars: int,
+    final: bool,
+) -> Optional[int]:
+    boundary_pattern = re.compile(r"(?<=[.!?;:\n])\s+")
+    for match in boundary_pattern.finditer(buffer):
+        if min_chars <= match.end() <= max_chars + 1:
+            return match.end()
+
+    if len(buffer) <= max_chars:
+        return len(buffer) if final else None
+
+    if len(buffer) <= max_chars + min_chars:
+        return len(buffer) if final else None
+
+    search_end = min(len(buffer), max_chars + 1)
+    search_start = min(min_chars, search_end)
+    candidate = -1
+    for separator in (",", ";", ":", "-", " "):
+        candidate = max(candidate, buffer.rfind(separator, search_start, search_end))
+    if candidate >= search_start:
+        return candidate + 1
+    return max_chars
+
+
+def _iter_pcm_blocks(
+    parts: Iterable[np.ndarray],
+    *,
+    target_samples: int,
+    chunk_samples: int,
+    trailing_silence_samples: int,
+) -> Iterator[np.ndarray]:
+    if target_samples < 0:
+        raise ValueError("target_samples cannot be negative.")
+    if chunk_samples <= 0:
+        raise ValueError("chunk_samples must be greater than zero.")
+    if trailing_silence_samples < 0:
+        raise ValueError("trailing_silence_samples cannot be negative.")
+
+    remaining = target_samples
+    pending = np.empty(0, dtype=np.float32)
+    for part in parts:
+        if remaining <= 0:
+            break
+        pcm = np.asarray(part, dtype=np.float32).reshape(-1)[:remaining]
+        remaining -= len(pcm)
+        if len(pcm):
+            pending = np.concatenate((pending, pcm))
+        while len(pending) >= chunk_samples:
+            yield np.ascontiguousarray(pending[:chunk_samples])
+            pending = pending[chunk_samples:]
+
+    if remaining:
+        raise RuntimeError(f"Vocoder stream ended {remaining} samples too early.")
+    if trailing_silence_samples:
+        pending = np.concatenate(
+            (pending, np.zeros(trailing_silence_samples, dtype=np.float32))
+        )
+    while len(pending) >= chunk_samples:
+        yield np.ascontiguousarray(pending[:chunk_samples])
+        pending = pending[chunk_samples:]
+    if len(pending):
+        yield np.ascontiguousarray(pending)
